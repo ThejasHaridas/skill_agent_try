@@ -1,6 +1,7 @@
 import os
+import uuid
 import yaml
-from typing import List, Dict
+from typing import List, Dict, Callable
 from langchain_openai import ChatOpenAI
 from langchain.tools import tool
 from langchain.agents import create_agent
@@ -9,19 +10,11 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents.middleware import ModelRequest, ModelResponse, AgentMiddleware
 from langchain.messages import SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
-from typing import Callable
 
 # ─────────────────────────────────────────────────────────────────
 # 1. CREDENTIALS — passed at runtime, nothing hardcoded
 # ─────────────────────────────────────────────────────────────────
 def get_db_uri() -> str:
-    """
-    Accepts DB credentials from environment variable or user input.
-    Supports any SQLAlchemy URI:
-      sqlite:///mydb.db
-      postgresql://user:pass@host:5432/dbname
-      mysql+pymysql://user:pass@host/dbname
-    """
     uri = os.environ.get("DB_URI")
     if not uri:
         print("\nNo DB_URI environment variable found.")
@@ -43,7 +36,7 @@ toolkit = SQLDatabaseToolkit(db=db, llm=model)
 sql_tools = toolkit.get_tools()
 
 # ─────────────────────────────────────────────────────────────────
-# 2. SKILL LOADER — reads .md files from ./skills directory
+# 2. SKILL LOADER
 # ─────────────────────────────────────────────────────────────────
 def load_skills_from_directory(directory: str = "./skills") -> List[Dict]:
     skills = []
@@ -74,9 +67,7 @@ SKILLS: List[Dict] = load_skills_from_directory("./skills")
 
 # ─────────────────────────────────────────────────────────────────
 # 3. AGENTIC TOOLS
-#    The agent calls these itself — no human guidance needed
 # ─────────────────────────────────────────────────────────────────
-
 @tool
 def discover_schema() -> str:
     """
@@ -131,9 +122,7 @@ def check_query_safety(query: str) -> str:
         query: The SQL query string to check
     """
     dangerous = ["DROP", "DELETE", "TRUNCATE", "ALTER", "UPDATE", "INSERT"]
-    query_upper = query.upper()
-
-    flagged = [kw for kw in dangerous if kw in query_upper]
+    flagged = [kw for kw in dangerous if kw in query.upper()]
     if flagged:
         return (
             f"UNSAFE QUERY DETECTED. "
@@ -144,15 +133,9 @@ def check_query_safety(query: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. MIDDLEWARE — injects skill descriptions only (not full content)
+# 4. MIDDLEWARE
 # ─────────────────────────────────────────────────────────────────
 class SkillMiddleware(AgentMiddleware):
-    """
-    Appends lightweight skill descriptions to system prompt.
-    Full skill content only enters context when agent calls load_skill().
-    """
-
-    # Registers these tools so the agent can call them
     tools = [discover_schema, load_skill, check_query_safety]
 
     def __init__(self):
@@ -170,7 +153,7 @@ class SkillMiddleware(AgentMiddleware):
         addendum = (
             f"\n\n## Available Skills\n\n"
             f"{self.skills_summary}\n\n"
-            "Call `load_skill(<n>)` to load a skill's full instructions. "
+            "Call `load_skill(<name>)` to load a skill's full instructions. "
             "Only load what you need."
         )
         new_content = list(request.system_message.content_blocks) + [
@@ -183,7 +166,7 @@ class SkillMiddleware(AgentMiddleware):
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. AGENT — autonomous loop, no human guidance needed
+# 5. AGENT
 # ─────────────────────────────────────────────────────────────────
 agent = create_agent(
     model,
@@ -219,20 +202,26 @@ agent = create_agent(
 
 
 # ─────────────────────────────────────────────────────────────────
-# 6. EXECUTION
+# 6. EXECUTION — fresh thread_id per question (Option A)
+#
+#    WHY: Every question gets a brand new uuid as its thread_id.
+#    The InMemorySaver finds no existing history for that id,
+#    so the agent starts with a completely clean context:
+#
+#      [system prompt]          ~300 tokens   (fixed)
+#      [skill descriptions]     ~100 tokens   (fixed)
+#      [user question]          ~20 tokens
+#
+#    Schema, skills, SQL results load fresh each time and are
+#    discarded after the answer is returned. Context never
+#    accumulates across questions — stays flat every single turn.
 # ─────────────────────────────────────────────────────────────────
-def query_database(question: str, thread_id: str = "default_session"):
-    """
-    Run a natural language question against the database.
-    The agent handles everything: schema discovery, SQL generation,
-    error fixing, and result explanation.
+def query_database(question: str):
+    # New uuid = new thread = zero history = clean context
+    fresh_thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": fresh_thread_id}}
 
-    Args:
-        question:  Natural language question e.g. "What are total sales last month?"
-        thread_id: Session ID for conversation memory (default: 'default_session')
-    """
-    config = {"configurable": {"thread_id": thread_id}}
-    print(f"\n Question: {question}\n")
+    print(f"\nQuestion: {question}\n")
 
     response = agent.invoke(
         {"messages": [("user", question)]},
@@ -247,8 +236,7 @@ def query_database(question: str, thread_id: str = "default_session"):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Autonomous SQL Agent")
-    print("  Give it a question — it figures out the rest.")
+    print("  Autonomous SQL Agent  (fresh context per question)")
     print("=" * 60)
 
     while True:
